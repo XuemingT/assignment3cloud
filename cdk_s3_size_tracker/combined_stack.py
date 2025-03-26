@@ -1,6 +1,4 @@
-#!/usr/bin/env python3
 from aws_cdk import (
-    App,
     Stack,
     RemovalPolicy,
     Duration,
@@ -8,9 +6,6 @@ from aws_cdk import (
     aws_dynamodb as dynamodb,
     aws_lambda as _lambda,
     aws_s3_notifications as s3n,
-    aws_apigateway as apigw,
-    BundlingOptions,
-    DockerImage,
 )
 from constructs import Construct
 
@@ -102,42 +97,26 @@ class CombinedStack(Stack):
         self.table.grant_read_data(self.plotting_lambda)
         self.bucket.grant_write(self.plotting_lambda)
         
-        # Create the REST API for the plotting lambda
-        api = apigw.RestApi(
-            self,
-            "PlottingApi",
-            rest_api_name="S3-Size-Plotting-API",
-            description="API for triggering the plotting lambda",
-        )
-
-        # Since we can't bundle easily, let's use a simpler approach
+        # Create the driver lambda
         self.driver_lambda = _lambda.Function(
-            self,
-            "DriverLambda",
-            runtime=_lambda.Runtime.PYTHON_3_9,
-            handler="driver_lambda.handler",
-            code=_lambda.Code.from_asset("lambda/driver"),
-            timeout=Duration.seconds(60),
-            environment={
-                "S3_BUCKET_NAME": self.bucket.bucket_name,
-                "PLOTTING_API_ENDPOINT": f"{api.url}plot"
-            },
+    self,
+    "DriverLambda",
+    runtime=_lambda.Runtime.PYTHON_3_9,
+    handler="driver_lambda.handler",
+    code=_lambda.Code.from_asset("lambda/driver", 
+        bundling=_lambda.BundlingOptions(
+            image=_lambda.Runtime.PYTHON_3_9.bundling_image,
+            command=[
+                "bash", "-c",
+                "pip install --no-cache-dir -r requirements.txt -t /asset-output && cp -au . /asset-output"
+            ],
         )
+    ),
+    timeout=Duration.seconds(60),
+    environment={
+        "S3_BUCKET_NAME": self.bucket.bucket_name,
+    },
+)
         
         # Grant the driver lambda permissions to access S3
         self.bucket.grant_read_write(self.driver_lambda)
-        
-        # Add a resource and method to the API
-        plot_resource = api.root.add_resource("plot")
-        plot_integration = apigw.LambdaIntegration(self.plotting_lambda)
-        plot_resource.add_method("GET", plot_integration)
-
-
-# Create the CDK app
-app = App()
-
-# Create an instance of the combined stack
-CombinedStack(app, "S3SizeTrackerStack")
-
-# Synthesize the CloudFormation template
-app.synth()
