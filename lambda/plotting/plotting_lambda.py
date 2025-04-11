@@ -13,9 +13,9 @@ from boto3.dynamodb.conditions import Key
 dynamodb = boto3.resource('dynamodb')
 s3_client = boto3.client('s3')
 
-# Get environment variables
-table_name = os.environ['DYNAMODB_TABLE_NAME']
-bucket_name = os.environ['S3_BUCKET_NAME']
+# Get environment variables - updated variable names
+table_name = os.environ['TABLE_NAME']  # Changed from DYNAMODB_TABLE_NAME
+bucket_name = os.environ['BUCKET_NAME']  # Changed from S3_BUCKET_NAME
 table = dynamodb.Table(table_name)
 
 def handler(event, context):
@@ -24,7 +24,6 @@ def handler(event, context):
     Retrieves data from DynamoDB and creates a plot that is saved to S3.
     """
     print(f"Received event: {json.dumps(event)}")
-    
     
     try:
         # Get the current time and calculate the time 10 seconds ago
@@ -62,66 +61,105 @@ def get_recent_bucket_data(bucket_name, start_timestamp):
     Query DynamoDB to get bucket size data for the last 10 seconds.
     """
     try:
-        # Check if we need to use the base table or GSI based on key structure
-        try:
-            # First try querying with timestamp as partition key (base table)
-            response = table.query(
-                KeyConditionExpression=Key('timestamp').gte(start_timestamp)
-            )
-        except Exception:
-            # If that fails, try the GSI with bucket_name as partition key
-            response = table.query(
-                IndexName='TimestampIndex',
-                KeyConditionExpression=Key('bucket_name').eq(bucket_name) & 
-                                      Key('timestamp').gte(start_timestamp)
-            )
+        # Query with bucket_name as partition key
+        response = table.query(
+            KeyConditionExpression=Key('bucketName').eq(bucket_name) & 
+                                  Key('timestamp').gte(start_timestamp)
+        )
         
         # Sort data by timestamp
         items = sorted(response['Items'], key=lambda x: x['timestamp'])
         return items
     except Exception as e:
         print(f"Error querying recent bucket data: {str(e)}")
-        raise
+        # Try alternative key names if the first attempt fails
+        try:
+            response = table.query(
+                KeyConditionExpression=Key('bucket_name').eq(bucket_name) & 
+                                     Key('timestamp').gte(start_timestamp)
+            )
+            items = sorted(response['Items'], key=lambda x: x['timestamp'])
+            return items
+        except Exception as e2:
+            print(f"Second attempt failed: {str(e2)}")
+            raise
 
 def get_max_bucket_size(bucket_name):
     """
     Query DynamoDB to get the maximum bucket size ever recorded.
     """
     try:
-        try:
-            # First try with timestamp as partition key
-            response = table.scan()  # Might need a scan if we can't query directly
-        except Exception:
-            # Try with bucket_name as the partition key
-            response = table.query(
-                KeyConditionExpression=Key('bucket_name').eq(bucket_name)
-            )
+        # Query with bucketName as the partition key
+        response = table.query(
+            KeyConditionExpression=Key('bucketName').eq(bucket_name)
+        )
         
         if not response['Items']:
             return 0
         
-        # Make sure 'total_size' exists in the items
-        if 'total_size' in response['Items'][0]:
-            max_size = max(item['total_size'] for item in response['Items'])
-        else:
-            # Print the first item to see what fields are available
-            print(f"Item structure: {json.dumps(response['Items'][0], default=str)}")
-            max_size = 0  # Default if field not found
-            
+        # Make sure size field exists in the items (check both possible field names)
+        max_size = 0
+        for item in response['Items']:
+            # Check for different possible field names
+            if 'totalSize' in item:
+                size = float(item['totalSize'])
+            elif 'total_size' in item:
+                size = float(item['total_size'])
+            else:
+                continue
+                
+            if size > max_size:
+                max_size = size
+                
         return max_size
     except Exception as e:
         print(f"Error querying max bucket size: {str(e)}")
-        print(f"First few items: {json.dumps(response['Items'][:2], default=str)}")
-        raise
+        # Try alternative key names if the first attempt fails
+        try:
+            response = table.query(
+                KeyConditionExpression=Key('bucket_name').eq(bucket_name)
+            )
+            if not response['Items']:
+                return 0
+                
+            max_size = 0
+            for item in response['Items']:
+                if 'totalSize' in item:
+                    size = float(item['totalSize'])
+                elif 'total_size' in item:
+                    size = float(item['total_size'])
+                else:
+                    continue
+                    
+                if size > max_size:
+                    max_size = size
+                    
+            return max_size
+        except Exception as e2:
+            print(f"Second attempt failed: {str(e2)}")
+            print(f"First few items: {json.dumps(response['Items'][:2], default=str) if 'Items' in response and response['Items'] else 'No items'}")
+            raise
 
 def generate_plot(data, max_size):
     """
     Generate a plot of bucket size over time and save it to S3.
     """
     try:
-        # Extract data for plotting
-        timestamps = [item['timestamp'] for item in data]
-        sizes = [float(item['total_size']) for item in data]
+        # Extract data for plotting - handle different field names
+        timestamps = []
+        sizes = []
+        
+        for item in data:
+            timestamps.append(item['timestamp'])
+            
+            # Handle different possible field names
+            if 'totalSize' in item:
+                sizes.append(float(item['totalSize']))
+            elif 'total_size' in item:
+                sizes.append(float(item['total_size']))
+            else:
+                print(f"Warning: size field not found in item: {json.dumps(item, default=str)}")
+                sizes.append(0)  # Default if field not found
         
         # Create plot
         plt.figure(figsize=(10, 6))

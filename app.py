@@ -9,8 +9,14 @@ from aws_cdk import (
     aws_lambda as _lambda,
     aws_s3_notifications as s3n,
     aws_apigateway as apigw,
-    BundlingOptions,
-    DockerImage,
+    aws_sns as sns,
+    aws_sqs as sqs,
+    aws_sns_subscriptions as sns_subscriptions,
+    aws_lambda_event_sources as lambda_event_sources,
+    aws_logs as logs,
+    aws_cloudwatch as cloudwatch,
+    aws_cloudwatch_actions as cloudwatch_actions,
+    aws_iam as iam,
 )
 from constructs import Construct
 
@@ -32,7 +38,7 @@ class CombinedStack(Stack):
             self,
             "S3ObjectSizeHistory",
             partition_key=dynamodb.Attribute(
-                name="bucket_name",
+                name="bucketName",
                 type=dynamodb.AttributeType.STRING
             ),
             sort_key=dynamodb.Attribute(
@@ -47,7 +53,7 @@ class CombinedStack(Stack):
         self.table.add_global_secondary_index(
             index_name="TimestampIndex",
             partition_key=dynamodb.Attribute(
-                name="bucket_name",
+                name="bucketName",
                 type=dynamodb.AttributeType.STRING
             ),
             sort_key=dynamodb.Attribute(
@@ -56,7 +62,41 @@ class CombinedStack(Stack):
             ),
         )
 
-        # Create the size-tracking lambda
+        # NEW - SNS Topic for S3 events
+        self.s3_event_topic = sns.Topic(self, "S3EventTopic")
+        
+        # NEW - SQS Queues for consumers
+        self.size_tracking_queue = sqs.Queue(
+            self, 
+            "SizeTrackingQueue",
+            visibility_timeout=Duration.seconds(300)
+        )
+        
+        self.logging_queue = sqs.Queue(
+            self, 
+            "LoggingQueue",
+            visibility_timeout=Duration.seconds(300)
+        )
+        
+        # NEW - Subscribe queues to SNS topic
+        self.s3_event_topic.add_subscription(
+            sns_subscriptions.SqsSubscription(self.size_tracking_queue)
+        )
+        self.s3_event_topic.add_subscription(
+            sns_subscriptions.SqsSubscription(self.logging_queue)
+        )
+        
+        # NEW - Configure S3 to publish events to SNS (instead of directly to lambda)
+        self.bucket.add_event_notification(
+            s3.EventType.OBJECT_CREATED, 
+            s3n.SnsDestination(self.s3_event_topic)
+        )
+        self.bucket.add_event_notification(
+            s3.EventType.OBJECT_REMOVED, 
+            s3n.SnsDestination(self.s3_event_topic)
+        )
+
+        # Create the size-tracking lambda (updated to consume from SQS)
         self.size_tracking_lambda = _lambda.Function(
             self,
             "SizeTrackingLambda",
@@ -65,22 +105,93 @@ class CombinedStack(Stack):
             code=_lambda.Code.from_asset("lambda/size_tracking"),
             timeout=Duration.seconds(30),
             environment={
-                "DYNAMODB_TABLE_NAME": self.table.table_name,
+                "TABLE_NAME": self.table.table_name,
+                "BUCKET_NAME": self.bucket.bucket_name,
             },
+        )
+        
+        # NEW - Add SQS as event source for size-tracking lambda
+        self.size_tracking_lambda.add_event_source(
+            lambda_event_sources.SqsEventSource(self.size_tracking_queue)
         )
         
         # Grant the lambda permissions to access S3 and DynamoDB
         self.bucket.grant_read(self.size_tracking_lambda)
         self.table.grant_write_data(self.size_tracking_lambda)
         
-        # Add S3 bucket notifications to trigger the size-tracking lambda
-        self.bucket.add_event_notification(
-            s3.EventType.OBJECT_CREATED,
-            s3n.LambdaDestination(self.size_tracking_lambda)
+        # NEW - Create the logging lambda
+        self.logging_lambda = _lambda.Function(
+            self,
+            "LoggingLambda",
+            runtime=_lambda.Runtime.PYTHON_3_9,
+            handler="logging_lambda.handler",
+            code=_lambda.Code.from_asset("lambda/logging"),
+            timeout=Duration.seconds(30),
+            environment={
+                "BUCKET_NAME": self.bucket.bucket_name,
+                "PUBLISH_METRICS": "true"
+            },
         )
-        self.bucket.add_event_notification(
-            s3.EventType.OBJECT_REMOVED,
-            s3n.LambdaDestination(self.size_tracking_lambda)
+        
+        # NEW - Add SQS as event source for logging lambda
+        self.logging_lambda.add_event_source(
+            lambda_event_sources.SqsEventSource(self.logging_queue)
+        )
+        
+        # Grant permissions
+        self.bucket.grant_read(self.logging_lambda)
+        
+        # Give the logging Lambda permission to publish metrics
+        self.logging_lambda.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["cloudwatch:PutMetricData"],
+                resources=["*"]
+            )
+        )
+        
+        # NEW - Create log group for logging lambda
+        self.log_group = logs.LogGroup(
+            self, 
+            "LoggingLambdaLogGroup",
+            log_group_name=f"/aws/lambda/{self.logging_lambda.function_name}",
+            retention=logs.RetentionDays.ONE_WEEK,
+            removal_policy=RemovalPolicy.DESTROY
+        )
+
+        # NEW - Create alarm for total object size
+        self.size_alarm = cloudwatch.Alarm(
+            self, 
+            "TotalObjectSizeAlarm",
+            metric=cloudwatch.Metric(
+                namespace="Assignment4App",
+                metric_name="TotalObjectSize",
+                statistic="Sum",
+                period=Duration.minutes(1)  # Adjust based on testing
+            ),
+            threshold=20,
+            evaluation_periods=1,
+            comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD
+        )
+
+        # NEW - Cleaner Lambda
+        self.cleaner_lambda = _lambda.Function(
+            self,
+            "CleanerLambda",
+            runtime=_lambda.Runtime.PYTHON_3_9,
+            code=_lambda.Code.from_asset("lambda/cleaner"),
+            handler="cleaner_lambda.handler",
+            environment={
+                "BUCKET_NAME": self.bucket.bucket_name
+            },
+            timeout=Duration.seconds(30)
+        )
+        
+        # Grant permissions
+        self.bucket.grant_read_write(self.cleaner_lambda)
+        
+        # NEW - Configure alarm to trigger cleaner lambda
+        self.size_alarm.add_alarm_action(
+            cloudwatch_actions.LambdaAction(self.cleaner_lambda)
         )
         
         # Create the plotting lambda
@@ -93,8 +204,8 @@ class CombinedStack(Stack):
             timeout=Duration.seconds(60),
             memory_size=512,  # More memory for matplotlib
             environment={
-                "DYNAMODB_TABLE_NAME": self.table.table_name,
-                "S3_BUCKET_NAME": self.bucket.bucket_name,
+                "TABLE_NAME": self.table.table_name,
+                "BUCKET_NAME": self.bucket.bucket_name,
             },
         )
         
@@ -110,17 +221,17 @@ class CombinedStack(Stack):
             description="API for triggering the plotting lambda",
         )
 
-        # Since we can't bundle easily, let's use a simpler approach
+        # Update driver lambda with new test sequence and longer timeout
         self.driver_lambda = _lambda.Function(
             self,
             "DriverLambda",
             runtime=_lambda.Runtime.PYTHON_3_9,
             handler="driver_lambda.handler",
             code=_lambda.Code.from_asset("lambda/driver"),
-            timeout=Duration.seconds(60),
+            timeout=Duration.seconds(300),  # Increased timeout for waiting
             environment={
-                "S3_BUCKET_NAME": self.bucket.bucket_name,
-                "PLOTTING_API_ENDPOINT": f"{api.url}plot"
+                "BUCKET_NAME": self.bucket.bucket_name,
+                "API_URL": f"{api.url}plot"
             },
         )
         
